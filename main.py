@@ -1,15 +1,17 @@
 import math
+import os
 from typing import Tuple, Union
 
 import foolbox as fb
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
 import wandb
 from robustbench.data import load_cifar10
 from robustbench.utils import clean_accuracy
-from torch import nn, optim
+from torch import optim
 from torch.amp import GradScaler, autocast
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, Dataset
 from torchvision import datasets, transforms
 from tqdm import tqdm
 
@@ -305,7 +307,6 @@ def load_teacher_model():
     teacher_model = wideresnetwithswish("WideResNet-28-10-swish").to(DEVICE)
 
     # download the teacher checkpoint if it doesn't exist
-    import os
 
     import requests
 
@@ -338,9 +339,6 @@ def load_teacher_model():
     # move the model to cuda
     teacher_model.cuda()
 
-    # compile the model for optimized performance
-    teacher_model = torch.compile(teacher_model, mode="max-autotune")
-
     # set the model to evaluation mode
     teacher_model.eval()
 
@@ -370,52 +368,159 @@ def compute_rsa_batched(X, Y):
     return ((X_rsa - Y_rsa) ** 2).sum() / (batch_size * (batch_size - 1))
 
 
-@torch.compile()
-def add_noise_to_features(features, noise_level):
-    # add gaussian noise to feature maps
-    return [f + torch.randn_like(f) * noise_level for f in features]
+class teacher_augmented_cifar10(Dataset):
+    def __init__(self, cifar10_dataset, teacher_features, teacher_outputs):
+        # store the original cifar10 dataset
+        self.dataset = cifar10_dataset
+        # store the precomputed teacher features
+        self.teacher_features = teacher_features
+        # store the precomputed teacher outputs (logits)
+        self.teacher_outputs = teacher_outputs
+        # define data augmentation transforms
+        self.transform = transforms.Compose(
+            [
+                transforms.RandomCrop(32, padding=4),
+                transforms.RandomHorizontalFlip(),
+                transforms.ToTensor(),
+            ]
+        )
+
+    def __len__(self):
+        # return the length of the dataset
+        return len(self.dataset)
+
+    def __getitem__(self, idx):
+        # get the image and label from the original dataset
+        img, label = self.dataset[idx]
+        # apply data augmentation to the image
+        if isinstance(img, torch.Tensor):
+            img = transforms.ToPILImage()(img)
+        augmented_img = self.transform(img)
+        augmented_img = self.transform(img)
+        # return the augmented image, original label, teacher features, and teacher outputs
+        return (
+            augmented_img,
+            label,
+            self.teacher_features[idx],
+            self.teacher_outputs[idx],
+        )
 
 
-def load_data():
-    # load cifar10 dataset with data augmentation for training
-    transform_train = transforms.Compose(
+def precompute_teacher_features(
+    teacher_model, dataset, noise_level, rsa_block_group
+):
+    # set the teacher model to evaluation mode
+    teacher_model.eval()
+    # initialize lists to store all features and outputs
+    all_features = []
+    all_outputs = []
+
+    transform = transforms.Compose(
         [
-            transforms.RandomCrop(32, padding=4),
-            transforms.RandomHorizontalFlip(),
             transforms.ToTensor(),
         ]
     )
-    transform_test = transforms.Compose([transforms.ToTensor()])
 
-    trainset = datasets.CIFAR10(
-        root="./data",
-        train=True,
-        transform=transform_train,
-        download=True
-    )
-    testset = datasets.CIFAR10(
-        root="./data",
-        train=False,
-        transform=transform_test,
-        download=True
-    )
+    dataset.transform = transform
 
-    trainloader = DataLoader(
-        trainset,
-        batch_size=BATCH_SIZE,
-        shuffle=True,
-        num_workers=NUM_WORKERS,
-        pin_memory=True,
-    )
-    testloader = DataLoader(
-        testset,
+    # create a dataloader for the dataset
+    dataloader = DataLoader(
+        dataset,
         batch_size=BATCH_SIZE,
         shuffle=False,
         num_workers=NUM_WORKERS,
         pin_memory=True,
     )
 
-    return trainloader, testloader
+    # disable gradient computation for efficiency
+    with torch.no_grad():
+        # iterate over the dataloader with a progress bar
+        for inputs, _ in tqdm(dataloader, desc="Precomputing teacher features"):
+            # move inputs to the specified device (e.g., GPU)
+            inputs = inputs.to(DEVICE)
+            # forward pass through the teacher model, returning both outputs and features
+            outputs, features = teacher_model(inputs, return_features=True)
+
+            # select the appropriate block index based on the rsa_block_group
+            if rsa_block_group == "early":
+                block_index = 0
+            elif rsa_block_group == "middle":
+                block_index = 1
+            elif rsa_block_group == "late":
+                block_index = -1
+            else:
+                # raise an error if an invalid rsa_block_group is provided
+                raise ValueError("Invalid RSA_BLOCK_GROUP value")
+
+            # extract the selected features from the specified block
+            selected_features = features[block_index][block_index]
+
+            # generate gaussian noise with the same shape as the selected features
+            noise = torch.randn_like(selected_features) * noise_level
+            # add the generated noise to the selected features
+            noisy_features = selected_features + noise
+
+            # append the noisy features and outputs to their respective lists
+            all_features.append(noisy_features.cpu())
+            all_outputs.append(outputs.cpu())
+
+    # concatenate all features and outputs along the batch dimension
+    all_features = torch.cat(all_features, dim=0)
+    all_outputs = torch.cat(all_outputs, dim=0)
+
+    # return the precomputed features and outputs
+    return all_features, all_outputs
+
+
+def cache_teacher_data(
+    teacher_model, dataset, noise_level, rsa_block_group, cache_dir
+):
+    # construct the cache file path using the noise level
+    cache_file = os.path.join(
+        cache_dir, f"teacher_data_noise_{noise_level:.4f}.pt"
+    )
+
+    # check if the cache file already exists
+    if os.path.exists(cache_file):
+        # if it exists, load the cached data
+        print(f"loading cached teacher data from {cache_file}")
+        cached_data = torch.load(cache_file)
+        # return the features and outputs from the cached data
+        return cached_data["features"], cached_data["outputs"]
+
+    # if the cache file doesn't exist, precompute the teacher data
+    print("precomputing and caching teacher data...")
+    # call the precompute_teacher_features function to get features and outputs
+    all_features, all_outputs = precompute_teacher_features(
+        teacher_model, dataset, noise_level, rsa_block_group
+    )
+
+    # create the cache directory if it doesn't exist
+    os.makedirs(cache_dir, exist_ok=True)
+    # save the computed features and outputs to the cache file
+    torch.save({"features": all_features, "outputs": all_outputs}, cache_file)
+
+    # print a message indicating where the cached data was saved
+    print(f"cached teacher data saved to {cache_file}")
+    # return the computed features and outputs
+    return all_features, all_outputs
+
+
+def create_augmented_dataloader(
+    dataset, teacher_features, teacher_outputs, batch_size, num_workers
+):
+    # create an augmented dataset using the teacher_augmented_cifar10 class
+    augmented_dataset = teacher_augmented_cifar10(
+        dataset, teacher_features, teacher_outputs
+    )
+    # create and return a DataLoader for the augmented dataset
+    return DataLoader(
+        augmented_dataset,
+        batch_size=batch_size,
+        shuffle=True,
+        num_workers=num_workers,
+        pin_memory=True,
+    )
 
 
 def evaluate_model(model, x_test, y_test):
@@ -446,13 +551,11 @@ def evaluate_model(model, x_test, y_test):
 
 def train_epoch(
     student_model,
-    teacher_model,
-    trainloader,
+    augmented_trainloader,
     optimizer,
     criterion,
     scaler,
     beta,
-    noise_level,
     rsa_scale,
 ):
     # set student model to training mode
@@ -468,32 +571,33 @@ def train_epoch(
     optimizer.zero_grad()
 
     # iterate over batches in the trainloader
-    for i, (inputs, labels) in enumerate(trainloader):
+    for i, (
+        augmented_inputs,
+        labels,
+        teacher_features,
+        teacher_outputs,
+    ) in enumerate(augmented_trainloader):
         # move inputs and labels to the specified device
-        inputs, labels = inputs.to(DEVICE), labels.to(DEVICE)
-
+        augmented_inputs, labels = (
+            augmented_inputs.to(DEVICE),
+            labels.to(DEVICE),
+        )
+        teacher_features, teacher_outputs = (
+            teacher_features.to(DEVICE),
+            teacher_outputs.to(DEVICE),
+        )
         # use automatic mixed precision for faster training
-        with autocast("cuda"):
+        with autocast(device_type="cuda"):
             # get student model outputs and features
             student_outputs, student_features = student_model(
-                inputs, return_features=True
+                augmented_inputs, return_features=True
             )
 
-            # get teacher model features without gradient computation
-            with torch.no_grad():
-                _, teacher_features = teacher_model(
-                    inputs, return_features=True
-                )
-                # add noise to teacher features
-                teacher_features = [
-                    add_noise_to_features(tf_group, noise_level)
-                    for tf_group in teacher_features
-                ]
+            teacher_labels = torch.argmax(teacher_outputs, dim=1)
 
-            # compute cross-entropy loss for student outputs
-            student_loss = criterion(student_outputs, labels)
-            # store student loss for later averaging
+            student_loss = criterion(student_outputs, teacher_labels)
             student_losses.append(student_loss.item())
+
             # initialize rsa loss
             rsa_loss = 0
             # determine which block group to use for rsa loss
@@ -509,7 +613,7 @@ def train_epoch(
             # compute rsa loss for the selected feature group
             rsa_loss = compute_rsa_batched(
                 student_features[block_index][block_index],
-                teacher_features[block_index][block_index],
+                teacher_features,
             )
 
             # scale rsa loss
@@ -538,14 +642,13 @@ def train_epoch(
             # perform optimizer step and update scaler
             scaler.step(optimizer)
             scaler.update()
-            # zero out gradients
             optimizer.zero_grad()
 
         # accumulate running loss
         running_loss += loss.item() * ACCUMULATION_STEPS
 
     # compute average loss over the epoch
-    avg_loss = running_loss / len(trainloader)
+    avg_loss = running_loss / len(augmented_trainloader)
     # compute average rsa loss over the epoch
     avg_rsa_loss = sum(rsa_losses) / len(rsa_losses)
     # compute average student loss over the epoch
@@ -575,11 +678,20 @@ def train_and_evaluate(beta, noise_level, learning_rate):
         },
     )
 
-    # load training data
-    trainloader, _ = load_data()
-
     # load pre-trained teacher model
     teacher_model = load_teacher_model()
+
+    # Load CIFAR-10 dataset without augmentation
+    trainset = datasets.CIFAR10(root="./data", train=True, download=True)
+    # Load and cache teacher data
+    cache_dir = "./teacher_cache"
+    teacher_features, teacher_outputs = cache_teacher_data(
+        teacher_model, trainset, noise_level, RSA_BLOCK_GROUP, cache_dir
+    )
+    # Create new dataloader with augmented data and cached teacher features/outputs
+    augmented_trainloader = create_augmented_dataloader(
+        trainset, teacher_features, teacher_outputs, BATCH_SIZE, NUM_WORKERS
+    )
 
     # initialize student model
     student_model = wideresnetwithswish("WideResNet-28-10-swish").to(DEVICE)
@@ -596,20 +708,18 @@ def train_and_evaluate(beta, noise_level, learning_rate):
     scheduler = optim.lr_scheduler.CosineAnnealingLR(
         optimizer, T_max=NUM_EPOCHS
     )
-    scaler = GradScaler()
+    scaler = GradScaler(device=DEVICE)
 
     # training loop
     rsa_scale = 1.0
     for epoch in tqdm(range(NUM_EPOCHS), desc="training epochs"):
         loss, rsa_loss, student_loss, rsa_scale = train_epoch(
             student_model,
-            teacher_model,
-            trainloader,
+            augmented_trainloader,
             optimizer,
             criterion,
             scaler,
             beta,
-            noise_level,
             rsa_scale,
         )
         scheduler.step()
